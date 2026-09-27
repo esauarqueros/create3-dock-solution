@@ -1,0 +1,29 @@
+services:
+  dev:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        USER_UID: ${HOST_UID:-1000}
+        USER_GID: ${HOST_GID:-1000}
+
+    image: create3_dock:humble
+    container_name: create3_dock_dev
+
+    network_mode: host
+    ipc: host
+
+    environment:
+      - DISPLAY=${DISPLAY}
+      - QT_X11_NO_MITSHM=1
+      - ROS_DOMAIN_ID=42
+
+    volumes:
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+      - ../../..:/ws
+
+    #devices:
+    #  - /dev/dri:/dev/dri
+
+    stdin_open: true
+    tty: true
