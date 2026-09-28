@@ -12,7 +12,7 @@ Reto oficial: <https://github.com/Kalman-Robotics/create3_dock_challenge>
 | Nombre | Correo |
 |---|---|
 | Esaú Arqueros | esau.arqueros.24@gmail.com |
-| Elias | _(completar)_ |
+| Elias Cabeza | jose.cabeza@utec.edu.pe |
  
 ## Qué contiene este repo
  
