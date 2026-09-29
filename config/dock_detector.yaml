@@ -1,0 +1,47 @@
+dock_lidar:
+  ros__parameters:
+    frames:
+      base_frame: "base_link"
+      odom_frame: "odom"
+    debug:
+      enable_markers: true
+      marker_topic: "dock_detector/markers"
+    detector:
+      dock_geometry:
+        box_size: 0.08
+        box_gap: 0.095
+        box_protrusion: 0.08
+        wall_search_range_max: 3.0
+        wall_half_extent: 0.35
+        template_point_spacing: 0.01
+      ransac:
+        max_iterations: 200
+        inlier_threshold: 0.015
+        min_inlier_ratio: 0.35
+        min_inliers: 15
+      box_validation:
+        gap_tolerance: 0.02
+        protrusion_tolerance: 0.02
+        width_tolerance: 0.02
+        cluster_max_gap: 0.03
+        cluster_min_points: 2
+        min_protrusion_m: 0.03
+        max_protrusion_m: 0.15
+      icp:
+        enable: true
+        coarse_to_fine_range_m: 1.0
+        max_iterations: 25
+        max_correspondence_dist: 0.05
+        convergence_translation_eps: 0.002
+        convergence_rotation_eps_rad: 0.01
+        min_correspondences: 10
+        max_residual_rms: 0.02
+        max_translation_correction_m: 0.15
+        max_rotation_correction_rad: 0.52
+      filter:
+        alpha_min: 0.05
+        alpha_max: 0.6
+        confidence_decay_per_s: 0.5
+        lost_timeout_s: 1.5
+        max_jump_m: 0.5
+        outlier_reject_confidence: 0.3
