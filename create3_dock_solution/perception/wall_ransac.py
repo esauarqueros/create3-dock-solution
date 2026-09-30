@@ -18,6 +18,7 @@ class WallLine:
     normal: np.ndarray      # normal unitaria, apunta hacia el robot (origen)
     inlier_ratio: float
     num_inliers: int
+    inlier_mask: np.ndarray | None = None   # máscara sobre los puntos pasados a fit_wall
 
 
 def fit_wall(points: np.ndarray, params: RansacParams,
@@ -57,4 +58,6 @@ def fit_wall(points: np.ndarray, params: RansacParams,
     if np.dot(normal, -centroid) < 0.0:
         normal = -normal
 
-    return WallLine(point=centroid, normal=normal, inlier_ratio=ratio, num_inliers=best_count)
+    return WallLine(
+        point=centroid, normal=normal, inlier_ratio=ratio,
+        num_inliers=best_count, inlier_mask=best_mask)

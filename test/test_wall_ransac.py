@@ -19,6 +19,14 @@ def test_fit_wall_recovers_line_and_normal_towards_origin():
     assert wall.normal[0] < 0.0   # apunta hacia el origen (robot); la pared está en x>0
 
 
+def test_fit_wall_exposes_inlier_mask_matching_num_inliers():
+    points = _wall_points()
+    wall = fit_wall(points, RansacParams(), np.random.default_rng(1))
+    assert wall.inlier_mask is not None
+    assert wall.inlier_mask.shape[0] == points.shape[0]
+    assert int(wall.inlier_mask.sum()) == wall.num_inliers
+
+
 def test_fit_wall_rejects_sparse_cloud():
     points = np.random.default_rng(2).uniform(-0.05, 0.05, size=(5, 2))
     wall = fit_wall(points, RansacParams(min_inliers=15), np.random.default_rng(3))

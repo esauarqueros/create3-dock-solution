@@ -3,9 +3,11 @@ A1 usado como capa de validación geométrica (no como pipeline alterno).
 
 Dado el ajuste de pared (A2), busca puntos que sobresalen de ella, los agrupa
 en clusters y valida que un par de clusters tenga el hueco (~9.5cm) y ancho
-(~8cm) esperados de las dos cajas del dock.
+(~8cm) esperados de las dos cajas del dock. Las tolerancias se adaptan por
+rango (`adapt_box_params`) porque a mayor distancia caen menos puntos LIDAR
+sobre cada caja (resolución angular fija) -- ver docs/ESTRATEGIA.md.
 """
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import numpy as np
 
@@ -22,6 +24,7 @@ class CoarseDetection:
     gap_error: float
     width_error: float
     protrusion_error: float
+    support_points: int = 0   # puntos totales en los dos clusters aceptados
 
 
 def extract_protrusion_points(points: np.ndarray, wall: WallLine, params: BoxValidationParams):
@@ -59,6 +62,31 @@ def cluster_points(tangential: np.ndarray, params: BoxValidationParams):
     return [c for c in clusters if len(c) >= params.cluster_min_points]
 
 
+def adapt_box_params(
+        base: BoxValidationParams, distance_m: float, angle_inc: float) -> BoxValidationParams:
+    """
+    Relaja las tolerancias de validación en función del rango estimado.
+
+    A mayor distancia, el espaciado angular del LIDAR (`angle_inc * distance`)
+    crece y con él la incertidumbre de dónde caen los bordes de cada caja; las
+    tolerancias base actúan como piso (no se endurecen, solo se relajan más
+    allá de él). `cluster_min_points` también se reduce más allá de cierto
+    rango, ya que a esa distancia puede caer un solo punto por caja.
+    """
+    spacing = angle_inc * max(distance_m, 0.0)
+    cluster_min = base.cluster_min_points
+    if distance_m > base.cluster_min_points_far_range_m:
+        cluster_min = base.cluster_min_points_far
+    return replace(
+        base,
+        gap_tolerance=max(base.gap_tolerance, base.gap_tolerance_range_factor * spacing),
+        width_tolerance=max(base.width_tolerance, base.width_tolerance_range_factor * spacing),
+        protrusion_tolerance=max(
+            base.protrusion_tolerance, base.protrusion_tolerance_range_factor * spacing),
+        cluster_min_points=cluster_min,
+    )
+
+
 def _cluster_summary(tangential: np.ndarray, perp: np.ndarray, idx: np.ndarray) -> dict:
     t = tangential[idx]
     return {
@@ -67,16 +95,23 @@ def _cluster_summary(tangential: np.ndarray, perp: np.ndarray, idx: np.ndarray) 
         't_mid': float(t.mean()),
         'width': float(t.max() - t.min()),
         'perp_mean': float(perp[idx].mean()),
+        'n': int(len(idx)),
     }
 
 
 def _pair_errors(left: dict, right: dict, geom: DockGeometryParams) -> tuple[float, float, float]:
     gap = right['t_min'] - left['t_max']
     gap_error = abs(gap - geom.box_gap)
-    width_error = max(
-        abs(left['width'] - geom.box_size),
-        abs(right['width'] - geom.box_size),
-    )
+
+    # El ancho de un cluster de 1 punto es siempre 0 (no hay con qué medirlo);
+    # se excluye del chequeo de ancho en vez de forzar un error de 0.08m que
+    # ninguna tolerancia razonable podría absorber.
+    width_errors = [
+        abs(cluster['width'] - geom.box_size)
+        for cluster in (left, right) if cluster['n'] >= 2
+    ]
+    width_error = max(width_errors) if width_errors else 0.0
+
     protrusion_error = max(
         abs(left['perp_mean'] - geom.box_protrusion),
         abs(right['perp_mean'] - geom.box_protrusion),
@@ -120,6 +155,7 @@ def validate_boxes(
             detection = CoarseDetection(
                 pose=pose, gap_error=gap_error,
                 width_error=width_error, protrusion_error=protrusion_error,
+                support_points=left['n'] + right['n'],
             )
             best = (score, detection)
 
@@ -128,12 +164,22 @@ def validate_boxes(
 
 def coarse_confidence(
         coarse: CoarseDetection, wall: WallLine, ransac_p: RansacParams,
-        params: BoxValidationParams) -> float:
+        params: BoxValidationParams, geom: DockGeometryParams,
+        angle_inc: float, distance: float) -> float:
     inlier_ratio_score = wall.inlier_ratio / max(ransac_p.min_inlier_ratio, 1e-6)
     inlier_score = float(np.clip(inlier_ratio_score, 0.0, 1.0))
     gap_score = max(0.0, 1.0 - coarse.gap_error / params.gap_tolerance)
     width_score = max(0.0, 1.0 - coarse.width_error / params.width_tolerance)
     protrusion_score = max(0.0, 1.0 - coarse.protrusion_error / params.protrusion_tolerance)
-    total = (0.4 * inlier_score + 0.2 * gap_score
-             + 0.2 * width_score + 0.2 * protrusion_score)
+
+    # Cobertura: cuántos puntos sostienen la detección frente a lo esperado a
+    # esta distancia (resolución angular fija) -- la confianza baja con
+    # gracia lejos, en vez de ser pass/fail solo por gap/ancho/protrusión.
+    denom = max(params.incidence_factor * angle_inc * distance, 1e-6)
+    expected_per_box = geom.box_size / denom
+    expected_pair = 2.0 * max(expected_per_box, 1.0)
+    coverage_score = float(np.clip(coarse.support_points / expected_pair, 0.0, 1.0))
+
+    total = (0.3 * inlier_score + 0.15 * gap_score + 0.15 * width_score
+             + 0.15 * protrusion_score + 0.25 * coverage_score)
     return float(np.clip(total, 0.0, 1.0))

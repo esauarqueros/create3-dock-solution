@@ -37,6 +37,7 @@ class RansacParams:
     inlier_threshold: float = 0.015
     min_inlier_ratio: float = 0.35
     min_inliers: int = 15
+    max_wall_candidates: int = 3
 
     @classmethod
     def from_dict(cls, data: dict):
@@ -52,6 +53,16 @@ class BoxValidationParams:
     cluster_min_points: int = 2
     min_protrusion_m: float = 0.03
     max_protrusion_m: float = 0.15
+    # Tolerancias/confianza adaptativas por rango (ver docs/ESTRATEGIA.md):
+    # a mayor distancia, menos puntos LIDAR caen sobre cada caja (resolución
+    # angular fija), así que las tolerancias fijas de arriba se usan como piso
+    # y se relajan proporcionalmente a angle_inc * distancia más allá de él.
+    gap_tolerance_range_factor: float = 2.5
+    width_tolerance_range_factor: float = 2.0
+    protrusion_tolerance_range_factor: float = 1.5
+    incidence_factor: float = 2.0
+    cluster_min_points_far: int = 1
+    cluster_min_points_far_range_m: float = 1.8
 
     @classmethod
     def from_dict(cls, data: dict):

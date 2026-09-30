@@ -24,12 +24,15 @@ _DETECTOR_PARAM_DEFAULTS = {
     },
     'ransac': {
         'max_iterations': 200, 'inlier_threshold': 0.015,
-        'min_inlier_ratio': 0.35, 'min_inliers': 15,
+        'min_inlier_ratio': 0.35, 'min_inliers': 15, 'max_wall_candidates': 3,
     },
     'box_validation': {
         'gap_tolerance': 0.02, 'protrusion_tolerance': 0.02, 'width_tolerance': 0.02,
         'cluster_max_gap': 0.03, 'cluster_min_points': 2,
         'min_protrusion_m': 0.03, 'max_protrusion_m': 0.15,
+        'gap_tolerance_range_factor': 2.5, 'width_tolerance_range_factor': 2.0,
+        'protrusion_tolerance_range_factor': 1.5, 'incidence_factor': 2.0,
+        'cluster_min_points_far': 1, 'cluster_min_points_far_range_m': 1.8,
     },
     'icp': {
         'enable': True, 'coarse_to_fine_range_m': 1.0, 'max_iterations': 25,

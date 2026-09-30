@@ -1,8 +1,5 @@
 import numpy as np
 
-from .perception.box_validator import (
-    cluster_points, coarse_confidence, extract_protrusion_points, validate_boxes,
-)
 from .perception.dock_model import (
     BoxValidationParams, build_template, DockGeometryParams, FilterParams, IcpParams, RansacParams,
 )
@@ -10,7 +7,7 @@ from .perception.geometry import polar_to_points, pose_compose, transform_points
 from .perception.icp_refiner import icp_confidence, is_refinement_plausible
 from .perception.icp_refiner import refine as icp_refine
 from .perception.temporal_filter import DockPoseFilter
-from .perception.wall_ransac import fit_wall
+from .perception.wall_selector import find_dock_wall
 from .types import DockEstimate, Pose2D
 
 
@@ -57,22 +54,21 @@ class DockDetector:
         near_mask = np.hypot(pts_base[:, 0], pts_base[:, 1]) <= self.geom.wall_search_range_max
         pts_near = pts_base[near_mask]
 
-        wall = fit_wall(pts_near, self.ransac_p, self._rng)
-        if wall is None:
+        # Puede haber varias paredes dentro de wall_search_range_max (p.ej. el
+        # robot arranca a un costado, cerca de una pared lisa distinta a la del
+        # dock): se prueban varias candidatas y se usa la firma de las cajas
+        # para elegir cuál es la pared correcta, no solo para validar la única
+        # que ganó un RANSAC global.
+        result = find_dock_wall(
+            pts_near, self.geom, self.ransac_p, self.box_p, self._rng,
+            angle_inc, self.ransac_p.max_wall_candidates)
+        if result is None:
             return self.filter.update(None, 0.0, stamp)
+        confidence, wall, coarse = result
         self.last_debug['wall'] = wall
-
-        tangential, perp = extract_protrusion_points(pts_near, wall, self.box_p)
-        clusters = cluster_points(tangential, self.box_p)
-
-        coarse = validate_boxes(clusters, tangential, perp, wall, self.geom, self.box_p)
-        if coarse is None:
-            return self.filter.update(None, 0.0, stamp)
         self.last_debug['coarse_pose'] = coarse.pose
 
         final_pose = coarse.pose
-        confidence = coarse_confidence(coarse, wall, self.ransac_p, self.box_p)
-
         distance = float(np.hypot(coarse.pose.x, coarse.pose.y))
         if self.icp_p.enable and distance <= self.icp_p.coarse_to_fine_range_m:
             refined = icp_refine(pts_near, self.template, coarse.pose, self.icp_p)

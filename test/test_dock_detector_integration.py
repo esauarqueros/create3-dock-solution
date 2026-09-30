@@ -69,3 +69,67 @@ def test_detector_returns_none_or_low_confidence_from_the_side():
         estimate = detector.update(ranges, angle_min, angle_inc, robot_pose, stamp=float(i) * 0.1)
 
     assert estimate is None or estimate.confidence < 0.3
+
+
+def test_detector_detects_dock_at_longer_range_with_graceful_confidence():
+    """
+    Reproduce el Escenario 2 (docs/ESTRATEGIA.md 9.2).
+
+    Con la pared correcta ya identificada sin ambigüedad (robot centrado), el
+    detector no debe necesitar acercarse a <1.4m para dar una estimación, con
+    una confianza usable (no cercana a 0) en todo el rango. No se exige que la
+    confianza decrezca monótonamente punto a punto: con pocas muestras por
+    caja, cuántas caen exactamente sobre ella depende de la fase de alineación
+    entre la rejilla angular fija del LIDAR (0.5°) y la ventana angular de la
+    caja en cada distancia puntual -- un artefacto de cuantización esperable
+    con tan pocos puntos, no un defecto del detector (la tendencia real, sobre
+    muchas orientaciones/posiciones, sí es decreciente; ver diagnóstico en
+    docs/ESTRATEGIA.md 9.2). Se evita el límite exacto de `wall_search_range_max`
+    (3.0m) porque ahí el filtro por rango euclidiano deja fuera casi toda la
+    pared salvo el punto exactamente al frente (geometría del campo de visión,
+    no relacionado con la validación de cajas).
+    """
+    robot_pose = Pose2D(0.0, 0.0, 0.0)
+
+    for wall_x in (1.5, 2.0, 2.5, 2.9):
+        ranges, angle_min, angle_inc = _synthetic_ranges(wall_x=wall_x)
+        detector = DockDetector(params={})
+        estimate = None
+        for i in range(8):
+            estimate = detector.update(
+                ranges, angle_min, angle_inc, robot_pose, stamp=float(i) * 0.1)
+        assert estimate is not None, f'sin detección a wall_x={wall_x}'
+        assert estimate.confidence > 0.5, f'confidence demasiado baja a wall_x={wall_x}'
+        assert abs(estimate.pose.x - wall_x) < 0.05
+        assert abs(estimate.pose.y) < 0.05
+
+
+def test_detector_confidence_trend_decreases_with_distance_on_average():
+    """
+    Confirma la tendencia real (promediada sobre varias fases angulares).
+
+    Una sola distancia puntual puede verse afectada por en qué fase cae la
+    rejilla angular fija respecto a la ventana de la caja (ver test anterior).
+    Promediando sobre varios corrimientos angulares pequeños, la tendencia de
+    fondo sí es decreciente con la distancia, como predice el modelo de
+    cobertura de `coarse_confidence` (docs/ESTRATEGIA.md 9.2).
+    """
+    robot_pose = Pose2D(0.0, 0.0, 0.0)
+    angle_offsets = np.linspace(0.0, np.deg2rad(0.4), 6)   # sub-muestrea la fase de la rejilla
+
+    def mean_confidence(wall_x: float) -> float:
+        confidences = []
+        for offset in angle_offsets:
+            ranges, angle_min, angle_inc = _synthetic_ranges(
+                wall_x=wall_x, angle_min=-np.pi + offset)
+            detector = DockDetector(params={})
+            estimate = None
+            for i in range(3):
+                estimate = detector.update(
+                    ranges, angle_min, angle_inc, robot_pose, stamp=float(i) * 0.1)
+            if estimate is not None:
+                confidences.append(estimate.confidence)
+        assert confidences, f'ninguna fase detectó el dock a wall_x={wall_x}'
+        return float(np.mean(confidences))
+
+    assert mean_confidence(1.5) > mean_confidence(2.9)
