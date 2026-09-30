@@ -166,7 +166,7 @@ def coarse_confidence(
         coarse: CoarseDetection, wall: WallLine, ransac_p: RansacParams,
         params: BoxValidationParams, geom: DockGeometryParams,
         angle_inc: float, distance: float) -> float:
-    inlier_ratio_score = wall.inlier_ratio / max(ransac_p.min_inlier_ratio, 1e-6)
+    inlier_ratio_score = wall.inlier_ratio / max(ransac_p.confidence_inlier_ratio_ref, 1e-6)
     inlier_score = float(np.clip(inlier_ratio_score, 0.0, 1.0))
     gap_score = max(0.0, 1.0 - coarse.gap_error / params.gap_tolerance)
     width_score = max(0.0, 1.0 - coarse.width_error / params.width_tolerance)

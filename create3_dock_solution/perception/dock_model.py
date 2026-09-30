@@ -35,9 +35,14 @@ class DockGeometryParams:
 class RansacParams:
     max_iterations: int = 200
     inlier_threshold: float = 0.015
-    min_inlier_ratio: float = 0.35
+    # Bajo a propósito: con varias paredes a la vista ninguna concentra >35% de
+    # los puntos; quien discrimina la pared del dock es la firma de las cajas.
+    min_inlier_ratio: float = 0.10
     min_inliers: int = 15
     max_wall_candidates: int = 3
+    # Referencia para el término de inliers de coarse_confidence (desacoplado
+    # del umbral de aceptación de arriba para no inflar la confianza).
+    confidence_inlier_ratio_ref: float = 0.35
 
     @classmethod
     def from_dict(cls, data: dict):
@@ -73,6 +78,8 @@ class BoxValidationParams:
 class IcpParams:
     enable: bool = True
     coarse_to_fine_range_m: float = 1.0
+    # False: el ICP solo corrige la posición y se conserva el yaw de la pared.
+    estimate_yaw: bool = False
     max_iterations: int = 25
     max_correspondence_dist: float = 0.05
     convergence_translation_eps: float = 0.002
@@ -95,6 +102,21 @@ class FilterParams:
     lost_timeout_s: float = 1.5
     max_jump_m: float = 0.5
     outlier_reject_confidence: float = 0.3
+    # Re-enganche: N mediciones seguidas rechazadas por salto pero a menos de
+    # reinit_consistency_m entre sí reemplazan la pose filtrada.
+    reinit_after_consecutive: int = 3
+    reinit_consistency_m: float = 0.10
+
+    @classmethod
+    def from_dict(cls, data: dict):
+        return _from_dict(cls, data)
+
+
+@dataclass
+class DeskewParams:
+    # Corrige el movimiento del robot durante el barrido (~0.1 s) del LIDAR
+    # real. No hace nada si el scan trae time_increment == 0 (Gazebo).
+    enable: bool = True
 
     @classmethod
     def from_dict(cls, data: dict):

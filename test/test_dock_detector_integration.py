@@ -1,6 +1,8 @@
 from create3_dock_solution.detector import DockDetector
+from create3_dock_solution.perception.geometry import integrate_unicycle
 from create3_dock_solution.types import Pose2D
 import numpy as np
+import pytest
 
 
 def _synthetic_ranges(
@@ -35,6 +37,101 @@ def _synthetic_ranges(
         ranges[i] = max(0.05, r + rng.normal(0.0, noise))
 
     return ranges, angle_min, angle_inc
+
+
+# Sala tipo la del reto, solo para generar scans de prueba (el paquete no usa
+# coordenadas del mundo): paredes en x=-3.95, x=1.95, y=±1.95; dock en (1.95, 0)
+# mirando hacia -x, con las dos cajas sobresaliendo 8 cm.
+_ROOM_DOCK = Pose2D(1.95, 0.0, np.pi)
+
+
+def _room_segments(box_gap=0.095, box_size=0.08, box_protrusion=0.08):
+    x_wall, half = 1.95, 1.95
+    segs = [((-3.95, -half), (x_wall, -half)), ((x_wall, -half), (x_wall, half)),
+            ((x_wall, half), (-3.95, half)), ((-3.95, half), (-3.95, -half))]
+    x_front = x_wall - box_protrusion
+    for sign in (1.0, -1.0):
+        y_in = sign * box_gap / 2.0
+        y_out = sign * (box_gap / 2.0 + box_size)
+        segs += [((x_front, y_in), (x_front, y_out)),
+                 ((x_front, y_in), (x_wall, y_in)), ((x_front, y_out), (x_wall, y_out))]
+    return np.array(segs, dtype=float)
+
+
+def _room_ranges(poses, angle_min=-np.pi, n=720, noise=0.001, seed=0):
+    """
+    Raycast de la sala: el haz i sale desde `poses[i]` (o `poses` si es una sola pose).
+
+    Pasar una pose por haz permite simular la distorsión de un robot moviéndose
+    durante el barrido.
+    """
+    rng = np.random.default_rng(seed)
+    if isinstance(poses, Pose2D):
+        poses = [poses] * n
+    angle_inc = 2 * np.pi / n
+    segs = _room_segments()
+    a, e = segs[:, 0, :], segs[:, 1, :] - segs[:, 0, :]
+    ranges = np.full(n, np.inf)
+    for i, pose in enumerate(poses):
+        o = np.array([pose.x, pose.y])
+        ang = pose.yaw + angle_min + i * angle_inc
+        d = np.array([np.cos(ang), np.sin(ang)])
+        # Intersección rayo o + t·d con segmento a + u·e (regla de Cramer).
+        denom = d[1] * e[:, 0] - d[0] * e[:, 1]
+        ok = np.abs(denom) > 1e-12
+        safe = np.where(ok, denom, 1.0)
+        rel = a - o
+        t = np.where(ok, (rel[:, 1] * e[:, 0] - rel[:, 0] * e[:, 1]) / safe, -1.0)
+        u = np.where(ok, (d[0] * rel[:, 1] - d[1] * rel[:, 0]) / safe, -1.0)
+        hits = t[(t > 0) & (u >= 0) & (u <= 1)]
+        ranges[i] = hits.min() + rng.normal(0.0, noise)
+    return ranges, angle_min, angle_inc
+
+
+def _lateral_error(estimate) -> float:
+    """Error del dock estimado a lo largo de la pared (m)."""
+    return abs(estimate.pose.y - _ROOM_DOCK.y)
+
+
+@pytest.mark.parametrize('start', [(0.0, 0.0), (0.41, -0.18)])
+def test_detector_detects_dock_from_room_center_with_three_walls_visible(start):
+    """
+    Desde el centro de la sala hay 3 paredes dentro del rango de búsqueda con ~33%.
+
+    de los puntos cada una: el umbral de ratio de inliers no debe impedir la
+    detección (antes, con 0.35, fallaba en todas las orientaciones).
+    """
+    for yaw in np.linspace(-3.0, 3.0, 7):
+        robot = Pose2D(start[0], start[1], float(yaw))
+        ranges, angle_min, angle_inc = _room_ranges(robot)
+        estimate = DockDetector(params={}).update(ranges, angle_min, angle_inc, robot, 0.0)
+
+        assert estimate is not None, f'sin detección desde {start}, yaw={yaw:.2f}'
+        assert abs(estimate.pose.x - _ROOM_DOCK.x) < 0.01
+        assert _lateral_error(estimate) < 0.01
+        yaw_err = abs(np.angle(np.exp(1j * (estimate.pose.yaw - _ROOM_DOCK.yaw))))
+        assert yaw_err < np.deg2rad(1.0)
+
+
+def test_detector_deskew_compensates_rotation_during_sweep():
+    """Robot girando a 1 rad/s: el barrido de 0.1 s desplaza el dock si no se corrige."""
+    v, w = 0.0, 1.0
+    n = 720
+    time_increment = 0.1 / n
+    start = Pose2D(0.5, 0.2, 0.3)
+    poses = [integrate_unicycle(start, v, w, i * time_increment) for i in range(n)]
+    ranges, angle_min, angle_inc = _room_ranges(poses)
+
+    def detect(deskew: bool):
+        detector = DockDetector(params={'deskew': {'enable': deskew}})
+        return detector.update(ranges, angle_min, angle_inc, start, 0.0,
+                               time_increment=time_increment, twist=(v, w))
+
+    corrected, raw = detect(True), detect(False)
+
+    assert corrected is not None
+    assert _lateral_error(corrected) < 0.01
+    assert raw is None or _lateral_error(raw) > 3 * _lateral_error(corrected)
 
 
 def test_detector_detects_dock_when_facing_it():

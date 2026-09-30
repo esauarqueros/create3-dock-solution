@@ -115,7 +115,7 @@ def test_coarse_confidence_decreases_with_sparser_coverage_at_range():
         inlier_ratio=0.35, num_inliers=100)
     geom = DockGeometryParams()
     box_p = BoxValidationParams()
-    ransac_p = RansacParams(min_inlier_ratio=0.35)
+    ransac_p = RansacParams(confidence_inlier_ratio_ref=0.35)
 
     def confidence_for(support_points: int, distance: float) -> float:
         coarse = CoarseDetection(

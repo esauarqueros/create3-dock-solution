@@ -30,6 +30,11 @@ def refine(points_base: np.ndarray, template_local: np.ndarray, init_pose: Pose2
     pocos cm/grados) -- esto es un refinamiento local, no una búsqueda global:
     con un desplazamiento inicial grande, la simetría del molde pared+2-cajas
     puede converger a un mínimo local incorrecto (ver `is_refinement_plausible`).
+
+    Con `params.estimate_yaw=False` solo se estima la traslación y se conserva
+    el yaw de `init_pose`: la normal de una pared larga ajustada por RANSAC+SVD
+    es bastante más precisa en ángulo que lo que el ICP logra con los pocos
+    puntos de las cajas (ver docs/ESTRATEGIA.md §10).
     """
     if template_local.shape[0] == 0 or points_base.shape[0] == 0:
         return None
@@ -49,11 +54,14 @@ def refine(points_base: np.ndarray, template_local: np.ndarray, init_pose: Pose2
 
         src_c = src.mean(axis=0)
         dst_c = dst.mean(axis=0)
-        h = (src - src_c).T @ (dst - dst_c)
-        u, _, vt = np.linalg.svd(h)
-        d = np.sign(np.linalg.det(vt.T @ u.T)) or 1.0
-        correction = np.diag([1.0, d])
-        r_delta = vt.T @ correction @ u.T
+        if params.estimate_yaw:
+            h = (src - src_c).T @ (dst - dst_c)
+            u, _, vt = np.linalg.svd(h)
+            d = np.sign(np.linalg.det(vt.T @ u.T)) or 1.0
+            correction = np.diag([1.0, d])
+            r_delta = vt.T @ correction @ u.T
+        else:
+            r_delta = np.eye(2)
         t_delta = dst_c - r_delta @ src_c
 
         r = r_delta @ r

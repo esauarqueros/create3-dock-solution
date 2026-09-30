@@ -13,6 +13,7 @@ from visualization_msgs.msg import Marker, MarkerArray
 
 from .controller import DockController
 from .detector import DockDetector
+from .perception.odom_history import OdomHistory
 from .types import Pose2D
 
 # Valores por defecto de los parámetros del detector -- deben reflejar
@@ -24,7 +25,8 @@ _DETECTOR_PARAM_DEFAULTS = {
     },
     'ransac': {
         'max_iterations': 200, 'inlier_threshold': 0.015,
-        'min_inlier_ratio': 0.35, 'min_inliers': 15, 'max_wall_candidates': 3,
+        'min_inlier_ratio': 0.10, 'min_inliers': 15, 'max_wall_candidates': 3,
+        'confidence_inlier_ratio_ref': 0.35,
     },
     'box_validation': {
         'gap_tolerance': 0.02, 'protrusion_tolerance': 0.02, 'width_tolerance': 0.02,
@@ -35,7 +37,8 @@ _DETECTOR_PARAM_DEFAULTS = {
         'cluster_min_points_far': 1, 'cluster_min_points_far_range_m': 1.8,
     },
     'icp': {
-        'enable': True, 'coarse_to_fine_range_m': 1.0, 'max_iterations': 25,
+        'enable': True, 'coarse_to_fine_range_m': 1.0, 'estimate_yaw': False,
+        'max_iterations': 25,
         'max_correspondence_dist': 0.05, 'convergence_translation_eps': 0.002,
         'convergence_rotation_eps_rad': 0.01, 'min_correspondences': 10, 'max_residual_rms': 0.02,
         'max_translation_correction_m': 0.15, 'max_rotation_correction_rad': 0.52,
@@ -43,7 +46,9 @@ _DETECTOR_PARAM_DEFAULTS = {
     'filter': {
         'alpha_min': 0.05, 'alpha_max': 0.6, 'confidence_decay_per_s': 0.5,
         'lost_timeout_s': 1.5, 'max_jump_m': 0.5, 'outlier_reject_confidence': 0.3,
+        'reinit_after_consecutive': 3, 'reinit_consistency_m': 0.10,
     },
+    'deskew': {'enable': True},
 }
 
 
@@ -74,12 +79,18 @@ class DockNode(Node):
         self.declare_parameter('frames.odom_frame', 'odom')
         self.declare_parameter('debug.enable_markers', True)
         self.declare_parameter('debug.marker_topic', 'dock_detector/markers')
+        self.declare_parameter('odom.history_s', 1.0)
+        self.declare_parameter('odom.max_extrapolation_s', 0.1)
 
         self.base_frame = self.get_parameter('frames.base_frame').value
         self.odom_frame = self.get_parameter('frames.odom_frame').value
         self._enable_markers = self.get_parameter('debug.enable_markers').value
 
         self.robot_pose: Pose2D | None = None
+        # Pose del robot en el instante de cada scan (no la última odometría).
+        self.odom_history = OdomHistory(
+            max_age_s=self.get_parameter('odom.history_s').value,
+            max_extrapolation_s=self.get_parameter('odom.max_extrapolation_s').value)
         self.dock = None
 
         self.tf_buffer = tf2_ros.Buffer()
@@ -129,26 +140,40 @@ class DockNode(Node):
 
         ranges = np.asarray(msg.ranges, dtype=float)
         stamp = Time.from_msg(msg.header.stamp).nanoseconds * 1e-9
+        robot_pose = self.odom_history.pose_at(stamp)
+        if robot_pose is None:
+            # Stamps de scan y odom fuera del historial (p.ej. relojes de LIDAR y
+            # robot sin sincronizar en el robot real): mejor la última odometría
+            # que descartar el scan.
+            self.get_logger().warn(
+                'Sin odometría en el instante del scan; se usa la última recibida',
+                throttle_duration_sec=5.0)
+            robot_pose = self.robot_pose
         self.dock = self.detector.update(
-            ranges, msg.angle_min, msg.angle_increment, self.robot_pose, stamp,
+            ranges, msg.angle_min, msg.angle_increment, robot_pose, stamp,
             laser_to_base=laser_to_base, range_min=msg.range_min, range_max=msg.range_max,
+            time_increment=msg.time_increment, twist=self.odom_history.twist_at(stamp),
         )
 
         if self._enable_markers:
-            self._publish_debug_markers()
+            self._publish_debug_markers(msg.header.stamp)
 
     def on_odom(self, msg: Odometry):
         p = msg.pose.pose.position
         q = msg.pose.pose.orientation
         self.robot_pose = Pose2D(x=p.x, y=p.y, yaw=_yaw_from_quaternion(q.x, q.y, q.z, q.w))
+        stamp = Time.from_msg(msg.header.stamp).nanoseconds * 1e-9
+        self.odom_history.add(
+            stamp, self.robot_pose, msg.twist.twist.linear.x, msg.twist.twist.angular.z)
 
     def on_timer(self):
         ...   # controller.step(...) -> publica Twist (a cargo del compañero del controller)
 
-    def _publish_debug_markers(self):
+    def _publish_debug_markers(self, stamp):
+        # Sellados con el stamp del scan: coincide con el reloj de TF/RViz tanto
+        # en simulación (use_sim_time) como en el robot real.
         markers = MarkerArray()
         debug = self.detector.last_debug
-        stamp = self.get_clock().now().to_msg()
 
         wall = debug.get('wall')
         if wall is not None:

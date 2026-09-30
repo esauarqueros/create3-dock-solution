@@ -1,9 +1,12 @@
 import numpy as np
 
 from .perception.dock_model import (
-    BoxValidationParams, build_template, DockGeometryParams, FilterParams, IcpParams, RansacParams,
+    BoxValidationParams, build_template, DeskewParams, DockGeometryParams, FilterParams, IcpParams,
+    RansacParams,
 )
-from .perception.geometry import polar_to_points, pose_compose, transform_points
+from .perception.geometry import (
+    deskew_points, polar_to_points, pose_compose, transform_points, valid_range_mask,
+)
 from .perception.icp_refiner import icp_confidence, is_refinement_plausible
 from .perception.icp_refiner import refine as icp_refine
 from .perception.temporal_filter import DockPoseFilter
@@ -31,13 +34,23 @@ class DockDetector:
         self.box_p = BoxValidationParams.from_dict(params.get('box_validation', {}))
         self.icp_p = IcpParams.from_dict(params.get('icp', {}))
         self.filter = DockPoseFilter(FilterParams.from_dict(params.get('filter', {})))
+        self.deskew_p = DeskewParams.from_dict(params.get('deskew', {}))
         self.template = build_template(self.geom)
         self._rng = np.random.default_rng(params.get('random_seed', 42))
         self.last_debug: dict = {}
 
     def update(self, ranges: np.ndarray, angle_min: float, angle_inc: float,
                robot_pose: Pose2D, stamp: float, laser_to_base: Pose2D | None = None,
-               range_min: float = 0.05, range_max: float = 25.0) -> DockEstimate | None:
+               range_min: float = 0.05, range_max: float = 25.0,
+               time_increment: float = 0.0,
+               twist: tuple[float, float] | None = None) -> DockEstimate | None:
+        """
+        Procesa un scan y devuelve la estimación filtrada del dock en `odom`.
+
+        `robot_pose` debe ser la pose del robot en `stamp` (primer haz del
+        scan), no la última odometría recibida. Si se pasan `time_increment` y
+        `twist` = (v, w) del robot, se corrige la distorsión del barrido.
+        """
         self.last_debug = {'wall': None, 'coarse_pose': None, 'refined_pose': None}
 
         pts_laser = polar_to_points(ranges, angle_min, angle_inc, range_min, range_max)
@@ -47,6 +60,9 @@ class DockDetector:
             pts_base = transform_points(pts_laser, laser_to_base)
         else:
             pts_base = pts_laser
+        if self.deskew_p.enable and time_increment != 0.0 and twist is not None:
+            beam_idx = np.flatnonzero(valid_range_mask(ranges, range_min, range_max))
+            pts_base = deskew_points(pts_base, beam_idx * time_increment, twist[0], twist[1])
 
         # Restringir al rango donde se espera el dock: evita que la mayoría de
         # puntos del cuarto (paredes lejanas, lecturas a rango máximo) diluyan la
