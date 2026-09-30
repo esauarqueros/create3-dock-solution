@@ -24,6 +24,8 @@ setup(
     },
     entry_points={
         'console_scripts': [
+		'control_node = create3_dock_solution.controller:main',
+        'marker_node = create3_dock_solution.marker_node:main',
         ],
     },
 )
