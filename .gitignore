@@ -2,9 +2,11 @@
 build/
 install/
 log/
+docs/
 __pycache__/
 *.pyc
 *.egg-info/
 .pytest_cache/
 rosbag*/
 *.mp4
+dock_runs/

@@ -1,0 +1,99 @@
+import numpy as np
+
+from .perception.dock_model import (
+    BoxValidationParams, build_template, DeskewParams, DockGeometryParams, FilterParams, IcpParams,
+    RansacParams,
+)
+from .perception.geometry import (
+    deskew_points, polar_to_points, pose_compose, transform_points, valid_range_mask,
+)
+from .perception.icp_refiner import icp_confidence, is_refinement_plausible
+from .perception.icp_refiner import refine as icp_refine
+from .perception.temporal_filter import DockPoseFilter
+from .perception.wall_selector import find_dock_wall
+from .types import DockEstimate, Pose2D
+
+
+class DockDetector:
+    """
+    Detección del dock a partir de un scan LIDAR ya expresado en `base_link`.
+
+    RANSAC de pared + validación geométrica de las cajas (A2+A1) a cualquier
+    distancia, refinado con ICP (A3) cuando el robot está lo bastante cerca.
+    La pose final se filtra en `odom` (EMA adaptativa por confidence).
+
+    Devuelve `None` cuando no hay una detección confiable -- p.ej. el caso en que
+    el robot arranca a un costado del dock y no puede ver ambas cajas -- para que
+    `controller.py` pueda construir su propia lógica de recuperación sobre esa señal.
+    """
+
+    def __init__(self, params: dict):
+        params = params or {}
+        self.geom = DockGeometryParams.from_dict(params.get('dock_geometry', {}))
+        self.ransac_p = RansacParams.from_dict(params.get('ransac', {}))
+        self.box_p = BoxValidationParams.from_dict(params.get('box_validation', {}))
+        self.icp_p = IcpParams.from_dict(params.get('icp', {}))
+        self.filter = DockPoseFilter(FilterParams.from_dict(params.get('filter', {})))
+        self.deskew_p = DeskewParams.from_dict(params.get('deskew', {}))
+        self.template = build_template(self.geom)
+        self._rng = np.random.default_rng(params.get('random_seed', 42))
+        self.last_debug: dict = {}
+
+    def update(self, ranges: np.ndarray, angle_min: float, angle_inc: float,
+               robot_pose: Pose2D, stamp: float, laser_to_base: Pose2D | None = None,
+               range_min: float = 0.05, range_max: float = 25.0,
+               time_increment: float = 0.0,
+               twist: tuple[float, float] | None = None) -> DockEstimate | None:
+        """
+        Procesa un scan y devuelve la estimación filtrada del dock en `odom`.
+
+        `robot_pose` debe ser la pose del robot en `stamp` (primer haz del
+        scan), no la última odometría recibida. Si se pasan `time_increment` y
+        `twist` = (v, w) del robot, se corrige la distorsión del barrido.
+        """
+        self.last_debug = {'wall': None, 'coarse_pose': None, 'refined_pose': None}
+
+        pts_laser = polar_to_points(ranges, angle_min, angle_inc, range_min, range_max)
+        if pts_laser.shape[0] == 0:
+            return self.filter.update(None, 0.0, stamp)
+        if laser_to_base is not None:
+            pts_base = transform_points(pts_laser, laser_to_base)
+        else:
+            pts_base = pts_laser
+        if self.deskew_p.enable and time_increment != 0.0 and twist is not None:
+            beam_idx = np.flatnonzero(valid_range_mask(ranges, range_min, range_max))
+            pts_base = deskew_points(pts_base, beam_idx * time_increment, twist[0], twist[1])
+
+        # Restringir al rango donde se espera el dock: evita que la mayoría de
+        # puntos del cuarto (paredes lejanas, lecturas a rango máximo) diluyan la
+        # proporción de inliers de la pared del dock durante el RANSAC.
+        near_mask = np.hypot(pts_base[:, 0], pts_base[:, 1]) <= self.geom.wall_search_range_max
+        pts_near = pts_base[near_mask]
+
+        # Puede haber varias paredes dentro de wall_search_range_max (p.ej. el
+        # robot arranca a un costado, cerca de una pared lisa distinta a la del
+        # dock): se prueban varias candidatas y se usa la firma de las cajas
+        # para elegir cuál es la pared correcta, no solo para validar la única
+        # que ganó un RANSAC global.
+        result = find_dock_wall(
+            pts_near, self.geom, self.ransac_p, self.box_p, self._rng,
+            angle_inc, self.ransac_p.max_wall_candidates)
+        if result is None:
+            return self.filter.update(None, 0.0, stamp)
+        confidence, wall, coarse = result
+        self.last_debug['wall'] = wall
+        self.last_debug['coarse_pose'] = coarse.pose
+
+        final_pose = coarse.pose
+        distance = float(np.hypot(coarse.pose.x, coarse.pose.y))
+        if self.icp_p.enable and distance <= self.icp_p.coarse_to_fine_range_m:
+            refined = icp_refine(pts_near, self.template, coarse.pose, self.icp_p)
+            plausible = refined is not None and is_refinement_plausible(
+                coarse.pose, refined.pose, self.icp_p)
+            if plausible:
+                final_pose = refined.pose
+                confidence = icp_confidence(refined, self.icp_p)
+                self.last_debug['refined_pose'] = refined.pose
+
+        pose_odom = pose_compose(robot_pose, final_pose)
+        return self.filter.update(pose_odom, confidence, stamp)
