@@ -21,7 +21,7 @@ setup(
     maintainer='vladix',
     maintainer_email='esau.arqueros.24@gmail.com',
     description='Docking del iRobot Create 3 usando solo LiDAR (Create 3 Dock Challenge).',
-    license='TODO: License declaration',
+    license='Apache-2.0',
     extras_require={
         'test': [
             'pytest',

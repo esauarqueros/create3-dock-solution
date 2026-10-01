@@ -5,7 +5,8 @@
   <version>0.0.0</version>
   <description>Docking del iRobot Create 3 usando solo LiDAR (Create 3 Dock Challenge).</description>
   <maintainer email="esau.arqueros.24@gmail.com">vladix</maintainer>
-  <license>TODO: License declaration</license>
+  <maintainer email="jose.cabeza@utec.edu.pe">Elias Cabeza</maintainer>
+  <license>Apache-2.0</license>
 
   <depend>rclpy</depend>
   <depend>sensor_msgs</depend>
