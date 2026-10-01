@@ -1,429 +1,379 @@
+"""
+Máquina de estados del docking (Python puro, sin rclpy).
+
+    SEARCH -> GO_TO_PREDOCK -> [ALIGN_AT_PREDOCK] -> FINAL_APPROACH -> DOCKED
+                   ^                  |                    |
+                   |                  v (abort)            v (abort / bump / stall)
+                   +-------------- BACK_OFF <--------------+
+                                                   FAILED (tras max_attempts)
+
+Basada en el controller del compañero (rama feat/robust-controller): ir al
+pre-dock, alinear y aproximación final con corrección lateral continua,
+abortos, reintentos, timeouts y watchdog de progreso. Cambios: SEARCH,
+BACK_OFF, modo `polar` (B3) que pasa directo a FINAL, objetivo que se sigue
+actualizando con el detector (se congela solo en los últimos cm), fin por
+`is_docked` y reacción a /hazard_detection. Ver docs/CONTROLADOR_IMPLEMENTADO.md.
+"""
 import math
+from typing import Callable
 
-import rclpy
-from rclpy.node import Node
-from rclpy.signals import SignalHandlerOptions
-from geometry_msgs.msg import Twist, PoseStamped
-from nav_msgs.msg import Odometry
+from .control.dock_targets import axis_errors, AxisErrors, dock_goal_from_marker, predock_from_goal
+from .control.laws import axis_tracking, clamp, go_to_point, polar_to_pose, rate_limit, rotate_to
+from .control.params import ControllerParams
+from .perception.geometry import pose_relative, wrap_angle
+from .types import Command, DockEstimate, HazardState, Pose2D
 
-
-def wrap(angle):
-    """Normaliza un ángulo a [-pi, pi]."""
-    return math.atan2(math.sin(angle), math.cos(angle))
-
-
-def clamp(x, lo, hi):
-    return max(lo, min(hi, x))
-
-
-def quat_to_yaw(q):
-    siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
-    cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
-    return math.atan2(siny_cosp, cosy_cosp)
+SEARCH = 'SEARCH'
+GO_TO_PREDOCK = 'GO_TO_PREDOCK'
+ALIGN_AT_PREDOCK = 'ALIGN_AT_PREDOCK'
+FINAL_APPROACH = 'FINAL_APPROACH'
+BACK_OFF = 'BACK_OFF'
+DOCKED = 'DOCKED'
+FAILED = 'FAILED'
 
 
-class ControlNode(Node):
+class DockController:
     """
-    Docking:
+    Contrato con `dock_node`.
 
-        GO_TO_PREDOCK -> ALIGN_AT_PREDOCK -> FINAL_APPROACH -> DOCKED
-                                                    \\-> (tras N intentos) FAILED
-
-    Fuente de la pose del dock:
-      - use_perception:=false (por defecto): pose fija (dock_x, dock_y, dock_theta_deg).
-      - use_perception:=true : se suscribe a /dock_pose (PoseStamped, frame odom).
-
-    Convención: dock_theta es la dirección en que el ROBOT viaja para entrar al dock.
+    `step(dock, robot_pose, is_docked, hazards, now) -> Command`, llamado a
+    20 Hz. `dock` es la última `DockEstimate` del detector (pose del marcador en
+    `odom`) o `None` si no hay detección fresca; `now` en segundos (mismo reloj
+    que el nodo). Expone `state`, `last_debug` (objetivos y errores, para
+    markers y el reporte) y `events` [(t desde el inicio, tipo, detalle)].
     """
 
-    STATES_WITH_TIMEOUT = ("GO_TO_PREDOCK", "ALIGN_AT_PREDOCK", "FINAL_APPROACH")
+    def __init__(self, params: ControllerParams | dict | None = None,
+                 log: Callable[[str], None] | None = None):
+        if not isinstance(params, ControllerParams):
+            params = ControllerParams.from_dict(params or {})
+        self.p = params
+        self._log = log or (lambda _msg: None)
+        self.reset()
 
-    def __init__(self):
-        super().__init__('control_node')
+    def set_params(self, params: ControllerParams):
+        """Cambia parámetros en caliente (p.ej. `ros2 param set`); el estado se conserva."""
+        self.p = params
 
-        # ---------------- Parámetros ROS ----------------
-        self.declare_parameter('use_perception', False)
-        self.declare_parameter('dock_topic', '/dock_pose')
-        self.declare_parameter('dock_frame', 'odom')
-        self.declare_parameter('dock_x', 1.0)
-        self.declare_parameter('dock_y', 0.2)
-        self.declare_parameter('dock_theta_deg', 90.0)
-
-        self.use_perception = self.get_parameter('use_perception').value
-        dock_topic = self.get_parameter('dock_topic').value
-        self.dock_frame = self.get_parameter('dock_frame').value
-
-        # ---------------- Comunicación ----------------
-        self.cmd_vel_pub = self.create_publisher(Twist, '/cmd_vel', 10)
-        self.odom_sub = self.create_subscription(
-            Odometry, '/odom', self.odom_callback, 10
-        )
-        if self.use_perception:
-            self.dock_sub = self.create_subscription(
-                PoseStamped, dock_topic, self.dock_pose_callback, 10
-            )
-        self.timer = self.create_timer(0.1, self.control_loop)
-
-        # ---------------- Pose del robot ----------------
-        self.robot_x = 0.0
-        self.robot_y = 0.0
-        self.robot_yaw = 0.0
-        self.odom_received = False
-
-        # ---------------- Pose del dock / pre-dock ----------------
-        self.d_pre = 0.50  # m detrás del dock, sobre el eje
-        self.target_x = 0.0
-        self.target_y = 0.0
-        self.target_theta = 0.0
-        self.pre_x = 0.0
-        self.pre_y = 0.0
-        self.dock_received = False
-        self.target_frozen = False
-
-        # Filtro / rechazo de estimaciones (solo con percepción)
-        self.alpha = 0.3                        # suavizado exponencial
-        self.max_jump = 0.30                    # m
-        self.max_jump_yaw = math.radians(30.0)
-        self.max_rejected = 5                   # rechazos seguidos antes de aceptar el cambio
-        self.rejected_count = 0
-
-        if not self.use_perception:
-            self.set_dock_target(
-                self.get_parameter('dock_x').value,
-                self.get_parameter('dock_y').value,
-                math.radians(self.get_parameter('dock_theta_deg').value),
-            )
-            self.dock_received = True
-
-        # ---------------- GO_TO_PREDOCK ----------------
-        self.k_v = 0.4
-        self.k_alpha = 1.5
-        self.v_max = 0.25
-        self.v_min = 0.03
-        self.w_max_go = 1.0
-        self.predock_tol = 0.03
-        self.rotate_in_place_angle = math.radians(60.0)
-
-        # ---------------- ALIGN_AT_PREDOCK ----------------
-        self.k_theta = 1.0
-        self.w_max_align = 0.6
-        self.w_min_align = 0.08
-        self.align_tol = math.radians(3.0)
-
-        # ---------------- FINAL_APPROACH ----------------
-        self.v_dock = 0.03
-        self.v_dock_slow = 0.015
-        self.slow_zone = 0.10
-        self.dock_distance = 0.03
-        self.k_lat = 5.0
-        self.max_lat_offset = math.radians(20.0)
-        self.k_yaw = 1.5
-        self.w_max_dock = 0.5
-        self.abort_lat = 0.08
-        self.abort_yaw = math.radians(25.0)
-
-        # ---------------- Robustez ----------------
-        self.max_attempts = 3
+    def reset(self):
+        self.state = SEARCH
         self.attempts = 0
-        self.state_timeouts = {
-            "GO_TO_PREDOCK": 90.0,
-            "ALIGN_AT_PREDOCK": 20.0,
-            "FINAL_APPROACH": 60.0,
-        }
-        self.progress_eps = 0.02        # m de mejora mínima en e_long
-        self.progress_timeout = 10.0    # s sin mejorar -> abortar intento
-        self.best_e_long = -float('inf')
-        self.best_e_long_time = 0.0
-        self.fail_reason = ""
-
-        # ---------------- Estado ----------------
-        self.state = "GO_TO_PREDOCK"
-        self.state_start = self.now_s()
-        self.v_cmd = 0.0
-        self.w_cmd = 0.0
-        self.print_counter = 0
-
-        src = 'PERCEPTION ' + dock_topic if self.use_perception else 'FIXED POSE'
-        self.get_logger().info(f'Control node started | dock source: {src}')
+        self.marker: Pose2D | None = None
+        self.goal: Pose2D | None = None
+        self.predock: Pose2D | None = None
+        self.events: list[tuple[float, str, str]] = []
+        self.last_debug: dict = {}
+        self.t_start: float | None = None
+        self._frozen = False
+        self._now = 0.0
+        self._robot: Pose2D | None = None
+        self._state_start = 0.0
+        self._prev_cmd = Command(0.0, 0.0)
+        self._search_phase = 'wait'
+        self._search_phase_start = 0.0
+        self._search_prev_yaw: float | None = None
+        self._search_turned = 0.0
+        self._backoff_start: Pose2D | None = None
+        self._best_e_long = -math.inf
+        self._best_e_long_time = 0.0
+        self._undocked_since: float | None = None
+        self._hold_e_long: float | None = None
 
     # ------------------------------------------------------------------
-    # Utilidades
-    # ------------------------------------------------------------------
-    def now_s(self):
-        return self.get_clock().now().nanoseconds * 1e-9
+    def step(self, dock: DockEstimate | None, robot_pose: Pose2D, is_docked: bool,
+             hazards: HazardState | None, now: float) -> Command:
+        if self.t_start is None:
+            self.t_start = now
+            self._state_start = now
+            self._search_phase_start = now
+            self._now = now
+            self._event('state', SEARCH)
+        dt = max(0.0, now - self._now)
+        self._now = now
+        self._robot = robot_pose
+        hazards = hazards or HazardState()
 
-    def set_dock_target(self, x, y, theta):
-        """Actualiza la pose del dock y recalcula el pre-dock sobre su eje."""
-        self.target_x = x
-        self.target_y = y
-        self.target_theta = theta
-        self.pre_x = x - self.d_pre * math.cos(theta)
-        self.pre_y = y - self.d_pre * math.sin(theta)
+        self._update_target(dock, robot_pose)
+        errors = axis_errors(self.goal, robot_pose) if self.goal is not None else None
 
-    def change_state(self, new_state):
-        self.get_logger().info(f"{self.state} -> {new_state}")
-        self.state = new_state
-        self.state_start = self.now_s()
+        if is_docked and self.state != DOCKED:
+            self._set_state(DOCKED, f'is_docked en {now - self.t_start:.1f} s')
 
-        if new_state == "GO_TO_PREDOCK":
-            self.target_frozen = False          # se puede refinar la estimación
-        elif new_state == "ALIGN_AT_PREDOCK":
-            self.target_frozen = True           # objetivo fijo desde aquí
-        elif new_state == "FINAL_APPROACH":
-            self.best_e_long = -float('inf')
-            self.best_e_long_time = self.now_s()
-
-    def abort_attempt(self, reason):
-        """Cuenta un intento fallido; reintenta o pasa a FAILED."""
-        self.attempts += 1
-        if self.attempts >= self.max_attempts:
-            self.fail(f"{reason} (attempt {self.attempts}/{self.max_attempts})")
+        emergency = False
+        v, w = 0.0, 0.0
+        hazard_action = self._handle_hazards(hazards, errors)
+        if hazard_action == 'stop':
+            emergency = True
         else:
-            self.get_logger().warn(
-                f"{reason} -> retry {self.attempts}/{self.max_attempts}, "
-                f"back to GO_TO_PREDOCK"
-            )
-            self.change_state("GO_TO_PREDOCK")
+            if hazard_action == 'backoff':
+                emergency = True
+            self._check_timeouts()
+            v, w = self._dispatch(dock, robot_pose, is_docked, hazards, errors)
 
-    def fail(self, reason):
-        self.fail_reason = reason
-        self.get_logger().error(f"DOCKING FAILED: {reason}")
-        self.change_state("FAILED")
+        cmd = self._shape_output(v, w, dt, emergency)
+        self._update_debug(errors, cmd, dock)
+        return cmd
 
     # ------------------------------------------------------------------
-    # Errores en el marco del dock
+    # Objetivo
     # ------------------------------------------------------------------
-    def dock_frame_errors(self):
-        """
-        e_long: negativo = aún no llega al dock, 0 = en el dock
-        e_lat : desviación lateral respecto al eje (positivo = izquierda)
-        e_yaw : target_theta - yaw
-        """
-        dx = self.robot_x - self.target_x
-        dy = self.robot_y - self.target_y
-        c = math.cos(self.target_theta)
-        s = math.sin(self.target_theta)
-
-        e_long = c * dx + s * dy
-        e_lat = -s * dx + c * dy
-        e_yaw = wrap(self.target_theta - self.robot_yaw)
-        return e_long, e_lat, e_yaw
+    def _update_target(self, dock: DockEstimate | None, robot: Pose2D):
+        if self.state == FINAL_APPROACH and self.goal is not None and not self._frozen:
+            if axis_errors(self.goal, robot).e_long > -self.p.final.freeze_within_m:
+                self._frozen = True
+                self._event('freeze', 'objetivo congelado')
+        if dock is not None and not self._frozen:
+            if self.marker is None:
+                self._event('first_detection', f'confidence={dock.confidence:.2f}')
+            self.marker = dock.pose
+        if self.marker is not None and not self._frozen:
+            g = self.p.geometry
+            self.goal = dock_goal_from_marker(self.marker, g.dock_offset_m)
+            self.predock = predock_from_goal(self.goal, g.predock_distance_m)
 
     # ------------------------------------------------------------------
-    # Callback de percepción (solo si use_perception:=true)
+    # Hazards
     # ------------------------------------------------------------------
-    def dock_pose_callback(self, msg):
-        if msg.header.frame_id and msg.header.frame_id != self.dock_frame:
-            self.get_logger().warn(
-                f"Dock pose in frame '{msg.header.frame_id}', expected "
-                f"'{self.dock_frame}'. Ignored.",
-                throttle_duration_sec=5.0
-            )
-            return
+    def _handle_hazards(self, hz: HazardState, errors: AxisErrors | None) -> str | None:
+        if self.state in (DOCKED, FAILED):
+            return None
+        if hz.cliff:
+            self._log_throttled('CLIFF/WHEEL_DROP: detenido')
+            return 'stop'
+        if not (hz.bump or hz.stall) or self.state == BACK_OFF:
+            return None
+        near_dock = (self.state == FINAL_APPROACH and errors is not None
+                     and errors.e_long > -self.p.hazard.bump_ignore_within_m)
+        if near_dock:
+            return None     # contacto esperado con el dock: seguir hasta is_docked
+        kind = 'bump' if hz.bump else 'stall'
+        self._event('hazard', kind)
+        counts = self.state in (GO_TO_PREDOCK, ALIGN_AT_PREDOCK, FINAL_APPROACH)
+        self._abort(f'{kind} en {self.state}', back_off=True, count=counts)
+        return 'backoff'
 
-        # Objetivo congelado: se ignoran estimaciones nuevas
-        if self.target_frozen:
-            return
+    # ------------------------------------------------------------------
+    # Transiciones
+    # ------------------------------------------------------------------
+    def _check_timeouts(self):
+        s = self.p.supervision
+        limits = {GO_TO_PREDOCK: s.approach_timeout_s, ALIGN_AT_PREDOCK: s.align_timeout_s,
+                  FINAL_APPROACH: s.final_timeout_s}
+        limit = limits.get(self.state)
+        if limit is not None and self._now - self._state_start > limit:
+            self._abort(f'timeout en {self.state} (> {limit:.0f} s)',
+                        back_off=self.state == FINAL_APPROACH)
 
-        x = msg.pose.position.x
-        y = msg.pose.position.y
-        th = quat_to_yaw(msg.pose.orientation)
-
-        # Primera estimación: se acepta tal cual
-        if not self.dock_received:
-            self.set_dock_target(x, y, th)
-            self.dock_received = True
-            self.get_logger().info(
-                f"First dock estimate: ({x:.2f}, {y:.2f}, {math.degrees(th):.1f} deg)"
-            )
-            return
-
-        # Rechazo de saltos bruscos (outliers)
-        jump = math.hypot(x - self.target_x, y - self.target_y)
-        jump_yaw = abs(wrap(th - self.target_theta))
-        if jump > self.max_jump or jump_yaw > self.max_jump_yaw:
-            self.rejected_count += 1
-            if self.rejected_count < self.max_rejected:
-                self.get_logger().warn(
-                    f"Dock estimate jump rejected ({jump:.2f} m, "
-                    f"{math.degrees(jump_yaw):.0f} deg)",
-                    throttle_duration_sec=2.0
-                )
+    def _abort(self, reason: str, back_off: bool, count: bool = True):
+        if count:
+            self.attempts += 1
+            if self.attempts >= self.p.supervision.max_attempts:
+                self._set_state(FAILED, f'{reason} (intento {self.attempts})')
                 return
-            # El cambio es persistente: se acepta sin filtrar
-            self.rejected_count = 0
-            self.set_dock_target(x, y, th)
-            self.get_logger().warn("Persistent dock change accepted")
+        target = BACK_OFF if back_off else (GO_TO_PREDOCK if self.goal is not None else SEARCH)
+        self._set_state(target, f'{reason} (intentos {self.attempts}/'
+                                f'{self.p.supervision.max_attempts})')
+
+    def _set_state(self, new_state: str, reason: str = ''):
+        old = self.state
+        if old == new_state:
             return
+        if old == FINAL_APPROACH and new_state != DOCKED:
+            self._frozen = False
+        self.state = new_state
+        self._state_start = self._now
+        if new_state == SEARCH:
+            self._search_phase = 'wait'
+            self._search_phase_start = self._now
+            self._search_prev_yaw = None
+            self._search_turned = 0.0
+        elif new_state == FINAL_APPROACH:
+            self._best_e_long = -math.inf
+            self._best_e_long_time = self._now
+        elif new_state == BACK_OFF:
+            self._backoff_start = self._robot
+        elif new_state == DOCKED:
+            self._undocked_since = None
+            self._hold_e_long = None
+        self._event('state', new_state, reason)
+        t = self._now - (self.t_start or self._now)
+        self._log(f'[{t:6.2f} s] {old} -> {new_state}' + (f' ({reason})' if reason else ''))
 
-        self.rejected_count = 0
+    def _event(self, kind: str, detail: str = '', extra: str = ''):
+        t = self._now - (self.t_start if self.t_start is not None else self._now)
+        self.events.append((t, kind, f'{detail} {extra}'.strip()))
 
-        # Suavizado exponencial
-        a = self.alpha
-        nx = self.target_x + a * (x - self.target_x)
-        ny = self.target_y + a * (y - self.target_y)
-        nth = wrap(self.target_theta + a * wrap(th - self.target_theta))
-        self.set_dock_target(nx, ny, nth)
+    def _log_throttled(self, msg: str):
+        if not self.events or self.events[-1][2] != msg:
+            self._event('info', msg)
+            self._log(msg)
 
     # ------------------------------------------------------------------
-    # Lazo de control
+    # Estados
     # ------------------------------------------------------------------
-    def control_loop(self):
-        if not self.odom_received:
-            return
+    def _dispatch(self, dock, robot, is_docked, hazards, errors) -> tuple[float, float]:
+        # Un estado puede transicionar y ceder el tick al siguiente (sin perder 50 ms).
+        for _ in range(3):
+            state = self.state
+            handler = {
+                SEARCH: self._search, GO_TO_PREDOCK: self._approach,
+                ALIGN_AT_PREDOCK: self._align, FINAL_APPROACH: self._final,
+                BACK_OFF: self._back_off, DOCKED: self._docked, FAILED: self._failed,
+            }[state]
+            result = handler(dock, robot, is_docked, hazards, errors)
+            if result is not None:
+                return result
+            errors = axis_errors(self.goal, robot) if self.goal is not None else None
+        return 0.0, 0.0
 
-        if not self.dock_received:
-            self.get_logger().info(
-                "Waiting for dock pose...", throttle_duration_sec=5.0
-            )
-            return
+    def _search(self, dock, robot, is_docked, hazards, errors):
+        if self.goal is not None and (
+                dock is None or dock.confidence >= self.p.supervision.min_confidence):
+            self._set_state(GO_TO_PREDOCK, 'dock detectado')
+            return None
+        sp = self.p.search
+        t_phase = self._now - self._search_phase_start
+        if self._search_phase == 'wait':
+            if t_phase < sp.wait_s:
+                return 0.0, 0.0
+            self._search_phase, self._search_phase_start = 'rotate', self._now
+            self._search_prev_yaw, self._search_turned = robot.yaw, 0.0
+        if self._search_phase == 'rotate':
+            self._search_turned += abs(wrap_angle(robot.yaw - self._search_prev_yaw))
+            self._search_prev_yaw = robot.yaw
+            if self._search_turned < 2.0 * math.pi:
+                return 0.0, sp.w
+            self._search_phase, self._search_phase_start = 'arc', self._now
+            self._event('search', 'vuelta completa sin detección: arco')
+            t_phase = 0.0
+        if t_phase < sp.arc_time_s:
+            scale = self.p.hazard.proximity_speed_scale if hazards.proximity else 1.0
+            return sp.arc_v * scale, sp.arc_w
+        self._search_phase, self._search_phase_start = 'rotate', self._now
+        self._search_prev_yaw, self._search_turned = robot.yaw, 0.0
+        return 0.0, sp.w
 
-        now = self.now_s()
-        e_long, e_lat, e_yaw = self.dock_frame_errors()
-
-        pdx = self.pre_x - self.robot_x
-        pdy = self.pre_y - self.robot_y
-        predock_dist = math.hypot(pdx, pdy)
-        predock_heading_err = wrap(math.atan2(pdy, pdx) - self.robot_yaw)
-
-        self.v_cmd = 0.0
-        self.w_cmd = 0.0
-
-        # ---------------- Timeout por estado ----------------
-        if self.state in self.STATES_WITH_TIMEOUT:
-            limit = self.state_timeouts[self.state]
-            if now - self.state_start > limit:
-                self.fail(f"timeout in {self.state} (> {limit:.0f} s)")
-
-        # ---------------- GO_TO_PREDOCK ----------------
-        if self.state == "GO_TO_PREDOCK":
-
-            if predock_dist < self.predock_tol:
-                self.change_state("ALIGN_AT_PREDOCK")
-            else:
-                self.w_cmd = clamp(
-                    self.k_alpha * predock_heading_err,
-                    -self.w_max_go, self.w_max_go
-                )
-                if abs(predock_heading_err) > self.rotate_in_place_angle:
-                    self.v_cmd = 0.0
+    def _approach(self, dock, robot, is_docked, hazards, errors):
+        if self.goal is None:
+            self._set_state(SEARCH, 'sin objetivo')
+            return None
+        ap = self.p.approach
+        rel = pose_relative(self.predock, robot)
+        rho = math.hypot(rel.x, rel.y)
+        if ap.mode == 'polar':
+            pp = self.p.polar
+            if rho < pp.switch_dist_m or (rho < 2.0 * pp.switch_dist_m and rel.x > 0.0):
+                aligned = (abs(errors.e_yaw) < math.radians(pp.switch_yaw_deg)
+                           and abs(errors.e_lat) < pp.switch_lat_m)
+                self._event('predock', 'polar')
+                if aligned:
+                    self._set_state(FINAL_APPROACH, 'pre-dock alineado (polar)')
                 else:
-                    v = self.k_v * predock_dist * max(0.0, math.cos(predock_heading_err))
-                    self.v_cmd = clamp(v, self.v_min, self.v_max)
-                    self.v_cmd = min(self.v_cmd, max(predock_dist * 2.0, 0.01))
+                    self._set_state(ALIGN_AT_PREDOCK, 'pre-dock desalineado (polar)')
+                return None
+            v, w = polar_to_pose(robot, self.predock, ap, pp)
+        else:
+            heading_err = wrap_angle(
+                math.atan2(self.predock.y - robot.y, self.predock.x - robot.x) - robot.yaw)
+            passed = rho < 1.5 * ap.tolerance_m and abs(heading_err) > math.pi / 2.0
+            if rho < ap.tolerance_m or passed:
+                self._event('predock', 'point_align')
+                self._set_state(ALIGN_AT_PREDOCK, f'pre-dock a {rho * 100:.1f} cm')
+                return None
+            v, w = go_to_point(robot, self.predock, ap)
+        if hazards.proximity:
+            v *= self.p.hazard.proximity_speed_scale
+        return v, w
 
-        # ---------------- ALIGN_AT_PREDOCK ----------------
-        elif self.state == "ALIGN_AT_PREDOCK":
+    def _align(self, dock, robot, is_docked, hazards, errors):
+        al = self.p.align
+        if abs(errors.e_lat) > al.abort_lat_m:
+            self._abort(f'fuera del eje en el pre-dock (e_lat={errors.e_lat:.3f} m)',
+                        back_off=False)
+            return None
+        if abs(errors.e_yaw) < math.radians(al.tolerance_deg):
+            self._set_state(FINAL_APPROACH, 'alineado')
+            return None
+        return 0.0, rotate_to(errors.e_yaw, al)
 
-            if abs(e_lat) > self.abort_lat:
-                self.abort_attempt(f"off axis at pre-dock (e_lat={e_lat:.3f} m)")
-            elif abs(e_yaw) < self.align_tol:
-                self.change_state("FINAL_APPROACH")
-            else:
-                w = self.k_theta * e_yaw
-                if abs(w) < self.w_min_align:
-                    w = math.copysign(self.w_min_align, e_yaw)
-                self.w_cmd = clamp(w, -self.w_max_align, self.w_max_align)
+    def _final(self, dock, robot, is_docked, hazards, errors):
+        fp = self.p.final
+        e = errors
+        if e.e_long > fp.overshoot_m:
+            self._abort(f'se pasó del dock sin is_docked (e_long={e.e_long:.3f} m)', back_off=True)
+            return None
+        if abs(e.e_lat) > fp.abort_lat_m or abs(e.e_yaw) > math.radians(fp.abort_yaw_deg):
+            self._abort(f'desvío en FINAL (e_lat={e.e_lat:.3f} m, '
+                        f'e_yaw={math.degrees(e.e_yaw):.1f} deg)', back_off=True)
+            return None
+        s = self.p.supervision
+        if e.e_long > self._best_e_long + s.progress_eps_m:
+            self._best_e_long, self._best_e_long_time = e.e_long, self._now
+        elif self._now - self._best_e_long_time > s.progress_timeout_s:
+            self._abort(f'sin progreso en FINAL por {s.progress_timeout_s:.0f} s', back_off=True)
+            return None
+        return axis_tracking(e.e_long, e.e_lat, e.e_yaw, fp)
 
-        # ---------------- FINAL_APPROACH ----------------
-        elif self.state == "FINAL_APPROACH":
+    def _back_off(self, dock, robot, is_docked, hazards, errors):
+        bp = self.p.backoff
+        start = self._backoff_start or robot
+        travelled = math.hypot(robot.x - start.x, robot.y - start.y)
+        if travelled >= bp.distance_m or self._now - self._state_start > bp.timeout_s:
+            next_state = GO_TO_PREDOCK if self.goal is not None else SEARCH
+            self._set_state(next_state, f'retrocedió {travelled:.2f} m')
+            return None
+        return -bp.v, 0.0
 
-            if e_long >= -self.dock_distance:
-                self.get_logger().info(
-                    f"DOCKED | e_long={e_long:.3f} m, e_lat={e_lat:.3f} m, "
-                    f"e_yaw={math.degrees(e_yaw):.2f} deg"
-                )
-                self.change_state("DOCKED")
+    def _docked(self, dock, robot, is_docked, hazards, errors):
+        if is_docked:
+            self._undocked_since = None
+        elif self._undocked_since is None:
+            self._undocked_since = self._now
+        elif self._now - self._undocked_since > self.p.supervision.undock_grace_s:
+            self._set_state(FINAL_APPROACH, 'is_docked se perdió')
+            return None
+        s = self.p.supervision
+        if errors is None or s.docked_hold_v <= 0.0:
+            return 0.0, 0.0
+        if self._hold_e_long is None:
+            self._hold_e_long = errors.e_long + s.docked_hold_advance_m
+        v = clamp(s.docked_hold_k * (self._hold_e_long - errors.e_long),
+                  -s.docked_hold_v, s.docked_hold_v)
+        return v, 0.0
 
-            elif abs(e_lat) > self.abort_lat or abs(e_yaw) > self.abort_yaw:
-                self.abort_attempt(
-                    f"abort final approach (e_lat={e_lat:.3f} m, "
-                    f"e_yaw={math.degrees(e_yaw):.1f} deg)"
-                )
-
-            else:
-                # Watchdog de progreso: e_long debe ir mejorando
-                if e_long > self.best_e_long + self.progress_eps:
-                    self.best_e_long = e_long
-                    self.best_e_long_time = now
-                elif now - self.best_e_long_time > self.progress_timeout:
-                    self.abort_attempt(
-                        f"no progress in final approach for "
-                        f"{self.progress_timeout:.0f} s"
-                    )
-
-                # Solo se calcula el comando si seguimos en FINAL_APPROACH
-                if self.state == "FINAL_APPROACH":
-                    lat_offset = clamp(
-                        math.atan(self.k_lat * e_lat),
-                        -self.max_lat_offset, self.max_lat_offset
-                    )
-                    yaw_ref = self.target_theta - lat_offset
-                    yaw_err_eff = wrap(yaw_ref - self.robot_yaw)
-
-                    self.w_cmd = clamp(
-                        self.k_yaw * yaw_err_eff, -self.w_max_dock, self.w_max_dock
-                    )
-                    v = self.v_dock_slow if e_long > -self.slow_zone else self.v_dock
-                    self.v_cmd = v * max(0.0, math.cos(yaw_err_eff))
-
-        # ---------------- DOCKED / FAILED ----------------
-        elif self.state in ("DOCKED", "FAILED"):
-            self.v_cmd = 0.0
-            self.w_cmd = 0.0
-
-        # ---------------- Log (1 Hz) ----------------
-        self.print_counter += 1
-        if self.print_counter >= 10:
-            self.get_logger().info(
-                f"State: {self.state} | "
-                f"PreDist: {predock_dist:.3f} m | "
-                f"e_long: {e_long:.3f} m | "
-                f"e_lat: {e_lat:.3f} m | "
-                f"e_yaw: {math.degrees(e_yaw):.2f} deg | "
-                f"v: {self.v_cmd:.3f} w: {self.w_cmd:.3f} | "
-                f"attempts: {self.attempts}/{self.max_attempts}"
-            )
-            self.print_counter = 0
-
-        # ---------------- Publicar ----------------
-        msg = Twist()
-        msg.linear.x = self.v_cmd
-        msg.angular.z = self.w_cmd
-        self.cmd_vel_pub.publish(msg)
+    def _failed(self, dock, robot, is_docked, hazards, errors):
+        return 0.0, 0.0
 
     # ------------------------------------------------------------------
-    # Odometría
-    # ------------------------------------------------------------------
-    def odom_callback(self, msg):
-        self.robot_x = msg.pose.pose.position.x
-        self.robot_y = msg.pose.pose.position.y
-        self.robot_yaw = quat_to_yaw(msg.pose.pose.orientation)
-        self.odom_received = True
+    def _shape_output(self, v: float, w: float, dt: float, emergency: bool) -> Command:
+        lim = self.p.limits
+        v = clamp(v, -lim.v_abs_max, lim.v_abs_max)
+        w = clamp(w, -lim.w_abs_max, lim.w_abs_max)
+        if emergency:
+            # Parada inmediata (sin rampa); la rampa sigue desde 0.
+            self._prev_cmd = Command(0.0, 0.0)
+            return Command(0.0, 0.0)
+        if self.state == FAILED:
+            v, w = 0.0, 0.0
+        else:
+            v = rate_limit(v, self._prev_cmd.v, lim.max_lin_acc, dt)
+            w = rate_limit(w, self._prev_cmd.w, lim.max_ang_acc, dt)
+        self._prev_cmd = Command(v, w)
+        return Command(v, w)
 
-
-def main(args=None):
-    rclpy.init(
-        args=args,
-        signal_handler_options=SignalHandlerOptions.NO
-    )
-
-    node = ControlNode()
-
-    try:
-        rclpy.spin(node)
-    except KeyboardInterrupt:
-        pass
-    finally:
-        try:
-            node.cmd_vel_pub.publish(Twist())
-            node.get_logger().info('Robot stopped safely')
-        except Exception:
-            pass
-        node.destroy_node()
-        if rclpy.ok():
-            rclpy.shutdown()
-
-
-if __name__ == '__main__':
-    main()
+    def _update_debug(self, errors: AxisErrors | None, cmd: Command, dock):
+        dist_predock = None
+        if self.predock is not None and self._robot is not None:
+            dist_predock = math.hypot(self.predock.x - self._robot.x,
+                                      self.predock.y - self._robot.y)
+        self.last_debug = {
+            'state': self.state, 'mode': self.p.approach.mode, 'attempts': self.attempts,
+            'marker': self.marker, 'goal': self.goal, 'predock': self.predock,
+            'frozen': self._frozen,
+            'e_long': errors.e_long if errors else None,
+            'e_lat': errors.e_lat if errors else None,
+            'e_yaw': errors.e_yaw if errors else None,
+            'dist_predock': dist_predock,
+            'confidence': dock.confidence if dock is not None else None,
+            'v': cmd.v, 'w': cmd.w,
+        }

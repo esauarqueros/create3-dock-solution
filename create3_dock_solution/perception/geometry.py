@@ -70,6 +70,18 @@ def pose_compose(base_to_parent: Pose2D, child_to_base: Pose2D) -> Pose2D:
     return Pose2D(x=float(point[0]), y=float(point[1]), yaw=yaw)
 
 
+def pose_relative(ref: Pose2D, pose: Pose2D) -> Pose2D:
+    """
+    Inversa de `pose_compose`: `pose` (en el frame padre) expresada en el frame de `ref`.
+
+    P.ej. la pose del robot (en odom) vista desde el frame del dock (en odom).
+    """
+    c, s = np.cos(ref.yaw), np.sin(ref.yaw)
+    dx, dy = pose.x - ref.x, pose.y - ref.y
+    return Pose2D(x=float(c * dx + s * dy), y=float(-s * dx + c * dy),
+                  yaw=wrap_angle(pose.yaw - ref.yaw))
+
+
 def _unicycle_displacement(v: float, w: float, dt: np.ndarray):
     """Desplazamiento (dx, dy, dyaw) de un uniciclo a (v, w) constantes, en su frame inicial."""
     dt = np.asarray(dt, dtype=float)

@@ -15,7 +15,7 @@ SHELL ["/bin/bash", "-c"]
 # 1) Herramientas generales + librerías de la solución
 RUN apt-get update && apt-get install -y --no-install-recommends \
       python3-colcon-common-extensions python3-rosdep python3-vcstool \
-      python3-pip python3-numpy python3-scipy \
+      python3-pip python3-numpy python3-scipy python3-matplotlib \
       git sudo vim less bash-completion mesa-utils \
     && rm -rf /var/lib/apt/lists/*
 

@@ -1,0 +1,95 @@
+# Parámetros del controller (mismo nodo dock_lidar que config/dock_detector.yaml).
+# Todos se pueden cambiar en caliente, p.ej.:
+#   ros2 param set /dock_lidar controller.final.v 0.10
+#   ros2 param set /dock_lidar controller.approach.mode polar
+# Los floats deben escribirse con punto decimal (0.10, no 0). Ángulos en grados.
+dock_lidar:
+  ros__parameters:
+    debug:
+      run_report:
+        enable: false              # true: guarda timeseries.csv, summary.json y run.png por corrida
+        output_dir: "/ws/dock_runs"
+        save_plot: true
+        tag: ""                    # texto libre para identificar la prueba
+    controller:
+      # Supervisión: activar/desactivar, frescura de la detección, intentos y timeouts
+      supervision:
+        enable: true
+        dock_max_age_s: 0.5
+        min_confidence: 0.3
+        max_attempts: 5
+        approach_timeout_s: 60.0
+        align_timeout_s: 15.0
+        final_timeout_s: 40.0
+        progress_eps_m: 0.01
+        progress_timeout_s: 6.0
+        undock_grace_s: 1.0
+        docked_hold_v: 0.02        # ya acoplado: mantener posición (|v| máx.); 0 = solo parar
+        docked_hold_k: 1.5
+        docked_hold_advance_m: 0.003
+      # Marcador (pared) -> dock real -> pre-dock (ver docs/CONTROLADOR_IMPLEMENTADO.md)
+      geometry:
+        dock_offset_m: 0.266
+        predock_distance_m: 0.4
+      # SEARCH: solo si el detector aún no ve el dock
+      search:
+        wait_s: 0.5
+        w: 0.5
+        arc_v: 0.1
+        arc_w: 0.4
+        arc_time_s: 3.0
+      # Ir al pre-dock (tramo rápido). mode: point_align | polar
+      approach:
+        mode: "point_align"
+        v_max: 0.25
+        v_min: 0.04
+        k_v: 0.8
+        w_max: 1.0
+        k_alpha: 1.5
+        rotate_in_place_deg: 60.0
+        tolerance_m: 0.04
+      # Modo polar (Astolfi): k_rho > 0, k_beta < 0, k_alpha > k_rho
+      polar:
+        k_rho: 0.5
+        k_alpha: 1.5
+        k_beta: -0.6
+        v_min_pass: 0.08
+        switch_dist_m: 0.08
+        switch_yaw_deg: 10.0
+        switch_lat_m: 0.03
+      # ALIGN_AT_PREDOCK: giro en sitio hacia el eje
+      align:
+        k_theta: 1.0
+        w_max: 0.6
+        w_min: 0.08
+        tolerance_deg: 2.0
+        abort_lat_m: 0.08
+      # FINAL_APPROACH (tramo lento, B2 tipo Stanley) hasta is_docked
+      final:
+        v: 0.08
+        v_slow: 0.04
+        slow_zone_m: 0.08
+        k_lat: 5.0
+        max_lat_offset_deg: 20.0
+        k_yaw: 1.5
+        w_max: 0.5
+        abort_lat_m: 0.08
+        abort_yaw_deg: 25.0
+        overshoot_m: 0.03
+        freeze_within_m: 0.12
+      # BACK_OFF: retroceso recto antes de reintentar
+      backoff:
+        distance_m: 0.25
+        v: 0.12
+        timeout_s: 5.0
+      # /hazard_detection
+      hazard:
+        hold_s: 0.3
+        bump_ignore_within_m: 0.06
+        proximity_speed_scale: 0.5
+      # Saturaciones y rampas de aceleración (0 = sin rampa)
+      limits:
+        v_abs_max: 0.3
+        w_abs_max: 1.9
+        max_lin_acc: 0.5
+        max_ang_acc: 3.0
