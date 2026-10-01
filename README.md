@@ -5,6 +5,10 @@ Solución al [Create 3 Dock Challenge](https://github.com/Kalman-Robotics/create
 Lee `/scan`, `/odom`, `/tf`, `/dock_status` y `/hazard_detection`, y comanda `/cmd_vel`. No usa
 la acción `/dock`, los sensores IR, el ground truth, `/gazebo/*` ni el frame `std_dock_link`.
 
+> **Para el jurado — commit a evaluar: `d305d7d`**
+> (`d305d7df60af886d38cb49a537f16b3513fb48c2`). Después de clonar:
+> `git checkout d305d7d`.
+
 ## Equipo: NorthDock
 
 | Nombre | Correo |
